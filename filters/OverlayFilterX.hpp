@@ -38,10 +38,14 @@
 #include <pdal/Polygon.hpp>
 #include <pdal/Streamable.hpp>
 
+#include <ogr_api.h>
+
+#include <iostream>
 #include <map>
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <variant>
 
 // Get GDAL's forward decls if available
 // otherwise make our own
@@ -69,16 +73,101 @@ typedef std::shared_ptr<void> OGRFeaturePtr;
 
 class Arg;
 
+// using IntOrReal = std::variant<int64_t, double>;
+using IntOrReal = int64_t;
+
+using IntOrRealList = std::vector<IntOrReal>;
+
+struct FieldInfo
+{
+    std::string name;
+    int index;
+    Dimension::Type type;
+
+    // FieldInfo(OGRLayerH lyr, std::string fieldName)
+    // : FieldInfo(lyr, OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0))
+    // {
+    // }
+
+    // FieldInfo(OGRLayerH lyr, int index) : index{index}
+    FieldInfo(OGRLayerH lyr, std::string fieldName)
+    {
+        name = fieldName;
+        index = OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0);
+        std::cout << "try: " << fieldName << " = " << index << "\n";
+        // TODO check index=-1 error
+        auto lyrDef = OGR_L_GetLayerDefn(lyr);
+        std::cout << "1 ";
+        auto fieldDef = OGR_FD_GetFieldDefn(lyrDef, index);
+        std::cout << "2 ";
+        auto ftype = OGR_Fld_GetType(fieldDef);
+        std::cout << "ftype = " << ftype << "\n";
+        std::cout << "3 ";
+        // auto x = OGR_FD_GetName(fieldDef);
+        // std::cout << x << "\n";
+        // if (x == nullptr)
+        // {
+        //     std::cout << "3 nullptr ";
+        //     x = "nullptr";
+        // }
+        // else
+        // {
+        //     name = x;
+        // }
+        std::cout << "4 ";
+        type = mapOGRToDimType(ftype);
+        std::cout << "5 ";
+    }
+
+    IntOrReal read(const OGRFeaturePtr featurePtr) const
+    {
+        return read(featurePtr.get());
+    }
+
+    IntOrReal read(const OGRFeatureH feature) const
+    {
+        switch (type)
+        {
+        case Dimension::Type::Double:
+            return OGR_F_GetFieldAsDouble(feature, index);
+
+        case Dimension::Type::Signed64:
+            return OGR_F_GetFieldAsInteger64(feature, index);
+
+        default:
+            // ???
+            return -1;
+        }
+    }
+
+    static Dimension::Type mapOGRToDimType(const OGRFieldType ogrType)
+    {
+        switch (ogrType)
+        {
+        case OGRFieldType::OFTReal:
+            return Dimension::Type::Double;
+
+        case OGRFieldType::OFTInteger64:
+        case OGRFieldType::OFTInteger:
+            return Dimension::Type::Signed64;
+
+        default:
+            return Dimension::Type::None;
+        }
+    }
+};
+
 class OverlayFilterX : public Filter, public Streamable
 {
+
     struct PolyVal
     {
         Polygon geom;
-        int64_t val;
+        IntOrRealList values;
     };
 
 public:
-    OverlayFilterX() : m_ds(0), m_lyr(0) {}
+    OverlayFilterX() : m_ds(0) {}
 
     std::string getName() const
     {
@@ -97,16 +186,19 @@ private:
     OverlayFilterX& operator=(const OverlayFilterX&) = delete;
     OverlayFilterX(const OverlayFilterX&) = delete;
 
-    std::vector<int64_t> intersect(double x, double y, bool firstOnly) const;
+    std::vector<IntOrRealList> intersect(double x, double y,
+                                         bool firstOnly) const;
 
     OGRDSPtr m_ds;
-    OGRLayerH m_lyr;
-    std::string m_dimName;
     std::string m_datasource;
-    std::string m_column;
+    StringList m_columns;
     std::string m_query;
     std::string m_layer;
-    Dimension::Id m_dim;
+
+    StringList m_dimNames;
+    Dimension::IdList m_dims;
+
+    std::vector<FieldInfo> m_fields;
     std::vector<PolyVal> m_polygons;
     BOX2D m_bounds;
     int m_threads;

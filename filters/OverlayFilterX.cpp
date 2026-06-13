@@ -34,10 +34,10 @@
 
 #include "OverlayFilterX.hpp"
 
+#include <iostream>
+#include <ogr_api.h>
 #include <thread>
 #include <vector>
-
-#include <ogr_api.h>
 
 #include <pdal/Polygon.hpp>
 #include <pdal/private/gdal/GDALUtils.hpp>
@@ -57,15 +57,15 @@ CREATE_STATIC_STAGE(OverlayFilterX, s_info)
 
 void OverlayFilterX::addArgs(ProgramArgs& args)
 {
-    args.add("dimension", "Dimension on which to filter", m_dimName)
+    args.add("dimension", "Dimensions to assign from columns", m_dimNames)
         .setPositional();
     args.add("datasource",
              "OGR-readable datasource for Polygon or Multipolygon data",
              m_datasource)
         .setPositional();
     args.add("column",
-             "OGR datasource column from which to read the attribute.",
-             m_column);
+             "OGR datasource columns from which to read the attribute.",
+             m_columns);
     args.add("query",
              "OGR SQL query to execute on the datasource to fetch geometry and "
              "attributes",
@@ -88,15 +88,25 @@ void OverlayFilterX::initialize()
 
 void OverlayFilterX::prepared(PointTableRef table)
 {
-    m_dim = table.layout()->findDim(m_dimName);
-    if (m_dim == Dimension::Id::Unknown)
-        throwError("Dimension '" + m_dimName + "' not found.");
+    for (const auto& name : m_dimNames)
+    {
+        auto id = table.layout()->findDim(name);
+        if (id == Dimension::Id::Unknown)
+            throwError("Dimension '" + name + "' not found.");
+        m_dims.push_back(id);
+    }
+    log()->get(LogLevel::Info) << "m_dims: " << m_dims.size() << "\n";
+
+    if (m_dims.size() != m_columns.size())
+        throwError("Number of dimensions and number of columns are not equal!");
+
     if (m_threads < 1)
         throwError("Number of threads should be positive.");
 }
 
 void OverlayFilterX::ready(PointTableRef table)
 {
+    // open data source
     m_ds = OGRDSPtr(OGROpen(m_datasource.c_str(), 0, 0),
                     [](OGRDSPtr::element_type* p)
                     {
@@ -106,58 +116,74 @@ void OverlayFilterX::ready(PointTableRef table)
     if (!m_ds)
         throwError("Unable to open data source '" + m_datasource + "'");
 
+    OGRLayerH lyr;
     if (!m_query.empty())
-        m_lyr = OGR_DS_ExecuteSQL(m_ds.get(), m_query.c_str(), 0, 0);
+        lyr = OGR_DS_ExecuteSQL(m_ds.get(), m_query.c_str(), 0, 0);
     else if (!m_layer.empty())
-        m_lyr = OGR_DS_GetLayerByName(m_ds.get(), m_layer.c_str());
+        lyr = OGR_DS_GetLayerByName(m_ds.get(), m_layer.c_str());
     else
-        m_lyr = OGR_DS_GetLayer(m_ds.get(), 0);
+        lyr = OGR_DS_GetLayer(m_ds.get(), 0);
 
-    if (!m_lyr)
+    if (!lyr)
         throwError("Unable to select layer '" + m_layer + "'");
 
+    log()->get(LogLevel::Info) << "layer name: " << m_layer << "\n";
+    log()->get(LogLevel::Info) << "query:      " << m_query << "\n";
+
+    // do spatial things
     if (!m_bounds.empty())
     {
         pdal::Polygon g(m_bounds.toWKT());
-        OGR_L_SetSpatialFilter(m_lyr, g.getOGRHandle());
+        OGR_L_SetSpatialFilter(lyr, g.getOGRHandle());
     }
 
+    gdal::SpatialRef sref;
+    sref.setFromLayer(lyr);
+    SpatialReference layerSrs(sref.wkt());
+
+    log()->get(LogLevel::Info) << "columns: " << m_columns.size() << "\n";
+    // gather field info
+    for (const auto& col : m_columns)
+    {
+        log()->get(LogLevel::Info) << " " << col << "\n";
+        m_fields.push_back(FieldInfo(lyr, col));
+    }
+    log()->get(LogLevel::Info) << "fields: " << m_fields.size() << "\n";
+    if (m_fields.empty())
+        m_fields.push_back(FieldInfo(lyr, 0));
+
+    // read features
     auto featureDeleter = [](OGRFeaturePtr::element_type* p)
     {
         if (p)
             ::OGR_F_Destroy(p);
     };
-    OGRFeaturePtr feature =
-        OGRFeaturePtr(OGR_L_GetNextFeature(m_lyr), featureDeleter);
 
-    int field_index(1); // default to first column if nothing was set
-    if (m_column.size())
+    for (auto feature =
+             OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter);
+         feature;
+         feature = OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter))
     {
-        field_index = OGR_F_GetFieldIndex(feature.get(), m_column.c_str());
-        if (field_index == -1)
-            throwError("No column name '" + m_column + "' was found.");
-    }
-
-    gdal::SpatialRef sref;
-    sref.setFromLayer(m_lyr);
-    SpatialReference layerSrs(sref.wkt());
-
-    do
-    {
+        log()->get(LogLevel::Info) << "reading a feature\n";
         OGRGeometryH geom = OGR_F_GetGeometryRef(feature.get());
-        int64_t fieldVal =
-            OGR_F_GetFieldAsInteger64(feature.get(), field_index);
 
-        m_polygons.push_back({Polygon(geom, layerSrs), fieldVal});
+        PolyVal pv;
+        pv.geom = Polygon(geom, layerSrs);
 
-        feature = OGRFeaturePtr(OGR_L_GetNextFeature(m_lyr), featureDeleter);
-    } while (feature);
+        for (const auto& field : m_fields)
+            pv.values.push_back(field.read(feature));
+
+        m_polygons.push_back(pv);
+    }
 
     // Initialise m_grids, otherwise this will lead to a race condition when
     // using threading.
     for (const auto& poly : m_polygons)
     {
         poly.geom.initGrids();
+        for (const auto& c : poly.values)
+            std::cout << c << " ";
+        std::cout << "\n";
     }
 }
 
@@ -188,15 +214,15 @@ bool OverlayFilterX::processOne(PointRef& point)
     return true;
 }
 
-std::vector<int64_t> OverlayFilterX::intersect(double x, double y,
-                                               bool firstOnly) const
+std::vector<IntOrRealList> OverlayFilterX::intersect(double x, double y,
+                                                     bool firstOnly) const
 {
-    std::vector<int64_t> data;
+    std::vector<IntOrRealList> data;
     for (const auto& poly : m_polygons)
     {
         if (poly.geom.contains(x, y))
         {
-            data.push_back(poly.val);
+            data.push_back(poly.values);
             if (firstOnly)
                 break;
         }
@@ -232,6 +258,7 @@ void OverlayFilterX::filter(PointView& view)
         threadList[t] = std::thread(
             [&](const PointId start, const PointId end, int t)
             {
+                // any reason to use this instead of index into view??
                 PointRef point(view, start);
 
                 for (PointId id = start; id < end; id++)
@@ -240,19 +267,96 @@ void OverlayFilterX::filter(PointView& view)
                     double x = point.getFieldAs<double>(Dimension::Id::X);
                     double y = point.getFieldAs<double>(Dimension::Id::Y);
 
-                    auto data = intersect(x, y, m_firstOnly);
-                    for (auto it = data.begin(); it != data.end(); ++it)
+                    // traverse the table, assign or create points
+                    auto features = intersect(x, y, m_firstOnly);
+                    // if (!features.empty())
+                    //     std::cout << "\nfeatures: " << features.size() <<
+                    //     "\n";
+                    for (size_t feat = 0; feat < features.size(); ++feat)
                     {
-                        if (it == data.begin())
+                        // the first polygon intersected must go to the
+                        // existing point. the remaining polygons cause
+                        // additional points to be created.
+                        if (feat == 0)
                         {
-                            point.setField(m_dim, *it);
+                            // std::cout << "*";
+                            auto featureCols = features[feat];
+                            // std::cout << "poly[" << feat
+                            //           << "] cols=" << featureCols.size()
+                            //           << " ;";
+                            for (size_t col = 0; col < featureCols.size();
+                                 ++col)
+                            {
+                                // the indices for the dimensions and feature
+                                // column should be aligned.
+                                auto targetDim = m_dims[col];
+                                auto dataForDim = featureCols[col];
+                                // std::cout << col << " ( " << (int)targetDim
+                                //           << ", " << dataForDim << " ) ";
+                                point.setField(targetDim, dataForDim);
+                            }
                         }
                         else
                         {
                             auto idxAppened = appendCopy(addedPoints[t], point);
-                            addedPoints[t]->setField(m_dim, idxAppened, *it);
+                            // toWrite =
+                            //     PointRef(addedPoints[t]->table(),
+                            //     idxAppened);
+                            auto featureCols = features[feat];
+                            // std::cout << "poly[" << feat
+                            //           << "] cols=" << featureCols.size()
+                            //           << " ;";
+                            for (size_t col = 0; col < featureCols.size();
+                                 ++col)
+                            {
+                                // the indices for the dimensions and feature
+                                // column should be aligned.
+                                auto targetDim = m_dims[col];
+                                auto dataForDim = featureCols[col];
+                                // std::cout << col << " ( " << (int)targetDim
+                                //           << ", " << dataForDim << " ) ";
+                                addedPoints[t]->setField(targetDim, idxAppened,
+                                                         dataForDim);
+                            }
                         }
+
+                        // auto featureCols = features[feat];
+                        // std::cout << "poly[" << feat
+                        //           << "] cols=" << featureCols.size() << " ;";
+                        // for (size_t col = 0; col < featureCols.size(); ++col)
+                        // {
+                        //     // the indices for the dimensions and feature
+                        //     column
+                        //     // should be aligned.
+                        //     auto targetDim = m_dims[col];
+                        //     auto dataForDim = featureCols[col];
+                        //     std::cout << col << " ( " << (int)targetDim << ",
+                        //     "
+                        //               << dataForDim << " )\n";
+                        //     toWrite.setField(targetDim, dataForDim);
+                        // }
                     }
+                    // std::cout << "\n";
+
+                    // for (auto featureCols = featureRows.begin();
+                    //      featureCols != featureRows.end(); ++featureCols)
+                    // {
+                    //     if (featureCols == featureRows.begin())
+                    //     {
+                    //         for (size_t i = 0; i < m_dims.size(); ++i)
+                    //             point.setField(m_dims[i],
+                    //             featureCols->at(i));
+                    //     }
+                    //     else
+                    //     {
+                    //         auto idxAppened = appendCopy(addedPoints[t],
+                    //         point); for (size_t i = 0; i < m_dims.size();
+                    //         ++i)
+                    //             addedPoints[t]->setField(m_dims[i],
+                    //             idxAppened,
+                    //                                      featureCols->at(i));
+                    //     }
+                    // }
                 }
             },
             t * chunk_size,
