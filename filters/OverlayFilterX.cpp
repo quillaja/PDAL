@@ -57,28 +57,19 @@ CREATE_STATIC_STAGE(OverlayFilterX, s_info)
 
 void OverlayFilterX::addArgs(ProgramArgs& args)
 {
-    args.add("dimension", "Dimensions to assign from columns", m_dimNames)
+    args.add("dimension", "Dimensions to assign from columns", m_dimNames).setPositional();
+    args.add("datasource", "OGR-readable datasource for Polygon or Multipolygon data", m_datasource)
         .setPositional();
-    args.add("datasource",
-             "OGR-readable datasource for Polygon or Multipolygon data",
-             m_datasource)
-        .setPositional();
-    args.add("column",
-             "OGR datasource columns from which to read the attribute.",
-             m_columns);
+    args.add("column", "OGR datasource columns from which to read the attribute.", m_columns);
     args.add("query",
              "OGR SQL query to execute on the datasource to fetch geometry and "
              "attributes",
              m_query);
     args.add("layer", "Datasource layer to use", m_layer);
     args.addSynonym("layer", "lyr_name");
-    args.add("bounds",
-             "Bounds to limit query using with OGR_L_SetSpatialFilter",
-             m_bounds);
-    args.add("threads", "Number of threads used to run this filter", m_threads,
-             1);
-    args.add("firstonly", "stop at first point-poly intersection", m_firstOnly,
-             true);
+    args.add("bounds", "Bounds to limit query using with OGR_L_SetSpatialFilter", m_bounds);
+    args.add("threads", "Number of threads used to run this filter", m_threads, 1);
+    args.add("firstonly", "stop at first point-poly intersection", m_firstOnly, true);
 }
 
 void OverlayFilterX::initialize()
@@ -159,9 +150,7 @@ void OverlayFilterX::ready(PointTableRef table)
             ::OGR_F_Destroy(p);
     };
 
-    for (auto feature =
-             OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter);
-         feature;
+    for (auto feature = OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter); feature;
          feature = OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter))
     {
         log()->get(LogLevel::Info) << "reading a feature\n";
@@ -214,8 +203,7 @@ bool OverlayFilterX::processOne(PointRef& point)
     return true;
 }
 
-std::vector<IntOrRealList> OverlayFilterX::intersect(double x, double y,
-                                                     bool firstOnly) const
+std::vector<IntOrRealList> OverlayFilterX::intersect(double x, double y, bool firstOnly) const
 {
     std::vector<IntOrRealList> data;
     for (const auto& poly : m_polygons)
@@ -230,13 +218,13 @@ std::vector<IntOrRealList> OverlayFilterX::intersect(double x, double y,
     return data;
 }
 
-point_count_t appendCopy(PointViewPtr targetView, PointRef srcPoint)
+point_count_t appendCopy(PointViewPtr targetView, const PointView& srcView, PointId srcId)
 {
     auto end = targetView->size();
     for (const auto& id : targetView->dims())
     {
         // stupid. float != int ffs
-        targetView->setField(id, end, srcPoint.getFieldAs<double>(id));
+        targetView->setField(id, end, srcView.getFieldAs<double>(id, srcId));
     }
     return end;
 }
@@ -258,109 +246,42 @@ void OverlayFilterX::filter(PointView& view)
         threadList[t] = std::thread(
             [&](const PointId start, const PointId end, int t)
             {
-                // any reason to use this instead of index into view??
-                PointRef point(view, start);
-
                 for (PointId id = start; id < end; id++)
                 {
-                    point.setPointId(id);
-                    double x = point.getFieldAs<double>(Dimension::Id::X);
-                    double y = point.getFieldAs<double>(Dimension::Id::Y);
+                    double x = view.getFieldAs<double>(Dimension::Id::X, id);
+                    double y = view.getFieldAs<double>(Dimension::Id::Y, id);
 
                     // traverse the table, assign or create points
                     auto features = intersect(x, y, m_firstOnly);
-                    // if (!features.empty())
-                    //     std::cout << "\nfeatures: " << features.size() <<
-                    //     "\n";
                     for (size_t feat = 0; feat < features.size(); ++feat)
                     {
                         // the first polygon intersected must go to the
                         // existing point. the remaining polygons cause
                         // additional points to be created.
+                        std::unique_ptr<PointRef> toWrite; // only way i could make it work
                         if (feat == 0)
                         {
-                            // std::cout << "*";
-                            auto featureCols = features[feat];
-                            // std::cout << "poly[" << feat
-                            //           << "] cols=" << featureCols.size()
-                            //           << " ;";
-                            for (size_t col = 0; col < featureCols.size();
-                                 ++col)
-                            {
-                                // the indices for the dimensions and feature
-                                // column should be aligned.
-                                auto targetDim = m_dims[col];
-                                auto dataForDim = featureCols[col];
-                                // std::cout << col << " ( " << (int)targetDim
-                                //           << ", " << dataForDim << " ) ";
-                                point.setField(targetDim, dataForDim);
-                            }
+                            toWrite = std::make_unique<PointRef>(view, id);
                         }
                         else
                         {
-                            auto idxAppened = appendCopy(addedPoints[t], point);
-                            // toWrite =
-                            //     PointRef(addedPoints[t]->table(),
-                            //     idxAppened);
-                            auto featureCols = features[feat];
-                            // std::cout << "poly[" << feat
-                            //           << "] cols=" << featureCols.size()
-                            //           << " ;";
-                            for (size_t col = 0; col < featureCols.size();
-                                 ++col)
-                            {
-                                // the indices for the dimensions and feature
-                                // column should be aligned.
-                                auto targetDim = m_dims[col];
-                                auto dataForDim = featureCols[col];
-                                // std::cout << col << " ( " << (int)targetDim
-                                //           << ", " << dataForDim << " ) ";
-                                addedPoints[t]->setField(targetDim, idxAppened,
-                                                         dataForDim);
-                            }
+                            auto idxAppened = appendCopy(addedPoints[t], view, id);
+                            toWrite = std::make_unique<PointRef>(*addedPoints[t], idxAppened);
                         }
 
-                        // auto featureCols = features[feat];
-                        // std::cout << "poly[" << feat
-                        //           << "] cols=" << featureCols.size() << " ;";
-                        // for (size_t col = 0; col < featureCols.size(); ++col)
-                        // {
-                        //     // the indices for the dimensions and feature
-                        //     column
-                        //     // should be aligned.
-                        //     auto targetDim = m_dims[col];
-                        //     auto dataForDim = featureCols[col];
-                        //     std::cout << col << " ( " << (int)targetDim << ",
-                        //     "
-                        //               << dataForDim << " )\n";
-                        //     toWrite.setField(targetDim, dataForDim);
-                        // }
+                        auto featureCols = features[feat];
+                        for (size_t col = 0; col < featureCols.size(); ++col)
+                        {
+                            // the indices for the dimensions and feature column
+                            // should be aligned.
+                            auto targetDim = m_dims[col];
+                            auto dataForDim = featureCols[col];
+                            toWrite->setField(targetDim, dataForDim);
+                        }
                     }
-                    // std::cout << "\n";
-
-                    // for (auto featureCols = featureRows.begin();
-                    //      featureCols != featureRows.end(); ++featureCols)
-                    // {
-                    //     if (featureCols == featureRows.begin())
-                    //     {
-                    //         for (size_t i = 0; i < m_dims.size(); ++i)
-                    //             point.setField(m_dims[i],
-                    //             featureCols->at(i));
-                    //     }
-                    //     else
-                    //     {
-                    //         auto idxAppened = appendCopy(addedPoints[t],
-                    //         point); for (size_t i = 0; i < m_dims.size();
-                    //         ++i)
-                    //             addedPoints[t]->setField(m_dims[i],
-                    //             idxAppened,
-                    //                                      featureCols->at(i));
-                    //     }
-                    // }
                 }
             },
-            t * chunk_size,
-            (t + 1) == m_threads ? npoints : (t + 1) * chunk_size, t);
+            t * chunk_size, (t + 1) == m_threads ? npoints : (t + 1) * chunk_size, t);
     }
 
     for (auto& t : threadList)
