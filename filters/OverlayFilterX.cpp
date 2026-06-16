@@ -34,8 +34,10 @@
 
 #include "OverlayFilterX.hpp"
 
+#include <cpl_conv.h>
 #include <iostream>
 #include <ogr_api.h>
+#include <ogr_srs_api.h>
 #include <thread>
 #include <vector>
 
@@ -128,12 +130,25 @@ void OverlayFilterX::ready(PointTableRef table)
         OGR_L_SetSpatialFilter(lyr, g.getOGRHandle());
     }
 
-    gdal::SpatialRef sref;
-    sref.setFromLayer(lyr);
-    SpatialReference layerSrs(sref.wkt());
+    // gdal::SpatialRef sref;
+    // sref.setFromLayer(lyr);
+    // SpatialReference layerSrs(sref.wkt());
 
-    log()->get(LogLevel::Info) << "columns: " << m_columns.size() << "\n";
+    // get layer srs wkt for polygon (alternative to above)
+    // needed to avoid private SpatialRef object
+    log()->get(LogLevel::Info) << "doing srs\n";
+    auto srs_h = OGR_L_GetSpatialRef(lyr);
+    char* c_wktstr = nullptr;
+    OSRExportToWkt(srs_h, &c_wktstr);
+    if (c_wktstr == nullptr)
+        throwError("bad srs");
+    std::string srs_wkt{c_wktstr};
+    CPLFree(c_wktstr);
+    SpatialReference mylayerSrs(srs_wkt);
+    // log()->get(LogLevel::Info) << "layer srs:  " << srs_wkt << "\n";
+
     // gather field info
+    log()->get(LogLevel::Info) << "columns: " << m_columns.size() << "\n";
     for (const auto& col : m_columns)
     {
         log()->get(LogLevel::Info) << " " << col << "\n";
@@ -157,7 +172,7 @@ void OverlayFilterX::ready(PointTableRef table)
         OGRGeometryH geom = OGR_F_GetGeometryRef(feature.get());
 
         PolyVal pv;
-        pv.geom = Polygon(geom, layerSrs);
+        pv.geom = Polygon(geom, mylayerSrs);
 
         for (const auto& field : m_fields)
             pv.values.push_back(field.read(feature));
