@@ -84,17 +84,13 @@ struct FieldInfo
     int index;
     Dimension::Type type;
 
-    // FieldInfo(OGRLayerH lyr, std::string fieldName)
-    // : FieldInfo(lyr, OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0))
-    // {
-    // }
-
-    // FieldInfo(OGRLayerH lyr, int index) : index{index}
     FieldInfo(OGRLayerH lyr, std::string fieldName)
+        : FieldInfo(lyr, OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0))
     {
-        name = fieldName;
-        index = OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0);
-        std::cout << "try: " << fieldName << " = " << index << "\n";
+    }
+
+    FieldInfo(OGRLayerH lyr, int index) : index{index}
+    {
         // TODO check index=-1 error
         auto lyrDef = OGR_L_GetLayerDefn(lyr);
         std::cout << "1 ";
@@ -103,17 +99,8 @@ struct FieldInfo
         auto ftype = OGR_Fld_GetType(fieldDef);
         std::cout << "ftype = " << ftype << "\n";
         std::cout << "3 ";
-        // auto x = OGR_FD_GetName(fieldDef);
-        // std::cout << x << "\n";
-        // if (x == nullptr)
-        // {
-        //     std::cout << "3 nullptr ";
-        //     x = "nullptr";
-        // }
-        // else
-        // {
-        //     name = x;
-        // }
+        name = OGR_Fld_GetNameRef(fieldDef);
+        std::cout << "name = " << name << "\n";
         std::cout << "4 ";
         type = mapOGRToDimType(ftype);
         std::cout << "5 ";
@@ -186,8 +173,7 @@ private:
     OverlayFilterX& operator=(const OverlayFilterX&) = delete;
     OverlayFilterX(const OverlayFilterX&) = delete;
 
-    std::vector<IntOrRealList> intersect(double x, double y,
-                                         bool firstOnly) const;
+    std::vector<IntOrRealList> intersect(double x, double y, bool firstOnly) const;
 
     OGRDSPtr m_ds;
     std::string m_datasource;
