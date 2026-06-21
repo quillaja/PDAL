@@ -38,7 +38,9 @@
 #include <pdal/Polygon.hpp>
 #include <pdal/Streamable.hpp>
 
+#include <cpl_conv.h>
 #include <ogr_api.h>
+#include <ogr_srs_api.h>
 
 #include <iostream>
 #include <map>
@@ -76,6 +78,8 @@ template <typename T = int64_t> struct FieldInfo
     std::string name;
     int index;
     Dimension::Type type;
+
+    FieldInfo() = default;
 
     FieldInfo(OGRLayerH lyr, std::string fieldName)
         : FieldInfo(lyr, OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0))
@@ -136,6 +140,10 @@ template <typename T = int64_t, typename GEOM = Polygon> struct Table
     {
         FieldInfo<T> meta;
         std::vector<T> values;
+
+        // Field() = delete;
+        Field() = default;
+        Field(const FieldInfo<T>& info) : meta{std::move(info)}, values{} {};
     };
 
     std::vector<GEOM> geom;
@@ -150,6 +158,7 @@ template <typename T = int64_t, typename GEOM = Polygon> struct Table
         std::unordered_map<std::string, T> data;
         for (const auto& [name, attrib] : attributes)
             data[name] = attrib.values[row];
+        return data;
     }
 };
 
@@ -158,9 +167,11 @@ template <typename T = int64_t> class Datasource
 public:
     Datasource() = delete;
     Datasource(const Datasource&) = delete;
+    Datasource operator=(const Datasource&) = delete;
 
-    Datasource(const std::string& source) : datasource{OGROpen(source.c_str(), 0, nullptr)} {};
-    Datasource(const std::string& source, const BOX2D& bounds) : Datasource(source), bounds{bounds}
+    Datasource(const std::string& source) : Datasource(source, BOX2D{}) {};
+    Datasource(const std::string& source, const BOX2D& bounds)
+        : datasource{OGROpen(source.c_str(), 0, nullptr)}, bounds{bounds}
     {
     }
 
@@ -171,17 +182,17 @@ public:
 
     Table<T> loadLayer(const std::string& layerName, const std::vector<std::string>& fields)
     {
-        load(OGR_DS_GetLayerByName(datasource, layerName.c_str()), fields);
+        return load(OGR_DS_GetLayerByName(datasource, layerName.c_str()), fields);
     }
     Table<T> loadQuery(const std::string& query, const std::vector<std::string>& fields)
     {
 
-        load(OGR_DS_ExecuteSQL(datasource, query.c_str(), 0, 0), fields);
+        return load(OGR_DS_ExecuteSQL(datasource, query.c_str(), 0, 0), fields);
     }
 
     Table<T> loadIndex(const uint32_t layerIndex, const std::vector<std::string>& fields)
     {
-        load(OGR_DS_GetLayer(datasource, layerIndex), fields);
+        return load(OGR_DS_GetLayer(datasource, layerIndex), fields);
     }
 
 private:
@@ -197,7 +208,7 @@ private:
 
         // fill attribute metadata
         for (const auto& field : fields)
-            t.attributes[field].meta = FieldInfo{lyr, field};
+            t.attributes.try_emplace(field, FieldInfo<T>{lyr, field});
 
         auto srs = getSrs(lyr);
 
@@ -229,7 +240,7 @@ private:
         char* c_wktstr = nullptr;
         OSRExportToWkt(srs_h, &c_wktstr);
         if (c_wktstr == nullptr)
-            throwError("bad srs");
+            throw std::exception("bad srs");
         const std::string srs_wkt{c_wktstr};
         CPLFree(c_wktstr);
         return SpatialReference{srs_wkt};
