@@ -250,14 +250,8 @@ private:
 class OverlayFilterX : public Filter, public Streamable
 {
 
-    struct PolyVal
-    {
-        Polygon geom;
-        std::vector<int64_t> values;
-    };
-
 public:
-    OverlayFilterX() : m_ds(0) {}
+    OverlayFilterX() {}
 
     std::string getName() const
     {
@@ -276,19 +270,19 @@ private:
     OverlayFilterX& operator=(const OverlayFilterX&) = delete;
     OverlayFilterX(const OverlayFilterX&) = delete;
 
-    std::vector<std::vector<int64_t>> intersect(double x, double y, bool firstOnly) const;
+    std::vector<size_t> intersect(double x, double y, bool firstOnly) const;
 
-    OGRDSPtr m_ds;
+    Table<int64_t, Polygon> m_table;
+
     std::string m_datasource;
-    StringList m_columns;
     std::string m_query;
     std::string m_layer;
 
+    // all 3 are index-aligned
+    StringList m_columns;
     StringList m_dimNames;
     Dimension::IdList m_dims;
 
-    std::vector<FieldInfo<int64_t>> m_fields;
-    std::vector<PolyVal> m_polygons;
     BOX2D m_bounds;
     int m_threads;
     bool m_firstOnly;

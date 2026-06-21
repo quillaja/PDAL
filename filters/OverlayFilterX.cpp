@@ -35,9 +35,10 @@
 #include "OverlayFilterX.hpp"
 
 #include <cpl_conv.h>
-#include <iostream>
 #include <ogr_api.h>
 #include <ogr_srs_api.h>
+
+#include <iostream>
 #include <thread>
 #include <vector>
 
@@ -99,105 +100,23 @@ void OverlayFilterX::prepared(PointTableRef table)
 
 void OverlayFilterX::ready(PointTableRef table)
 {
-    // open data source
-    m_ds = OGRDSPtr(OGROpen(m_datasource.c_str(), 0, 0),
-                    [](OGRDSPtr::element_type* p)
-                    {
-                        if (p)
-                            ::OGR_DS_Destroy(p);
-                    });
-    if (!m_ds)
-        throwError("Unable to open data source '" + m_datasource + "'");
+    Datasource<int64_t> ds{m_datasource, m_bounds};
 
-    OGRLayerH lyr;
     if (!m_query.empty())
-        lyr = OGR_DS_ExecuteSQL(m_ds.get(), m_query.c_str(), 0, 0);
+        m_table = ds.loadQuery(m_query, m_columns);
     else if (!m_layer.empty())
-        lyr = OGR_DS_GetLayerByName(m_ds.get(), m_layer.c_str());
+        m_table = ds.loadLayer(m_layer, m_columns);
     else
-        lyr = OGR_DS_GetLayer(m_ds.get(), 0);
-
-    if (!lyr)
-        throwError("Unable to select layer '" + m_layer + "'");
-
-    log()->get(LogLevel::Info) << "layer name: " << m_layer << "\n";
-    log()->get(LogLevel::Info) << "query:      " << m_query << "\n";
-
-    // do spatial things
-    if (!m_bounds.empty())
-    {
-        pdal::Polygon g(m_bounds.toWKT());
-        OGR_L_SetSpatialFilter(lyr, g.getOGRHandle());
-    }
-
-    // gdal::SpatialRef sref;
-    // sref.setFromLayer(lyr);
-    // SpatialReference layerSrs(sref.wkt());
-
-    // get layer srs wkt for polygon (alternative to above)
-    // needed to avoid private SpatialRef object
-    log()->get(LogLevel::Info) << "doing srs\n";
-    auto srs_h = OGR_L_GetSpatialRef(lyr);
-    char* c_wktstr = nullptr;
-    OSRExportToWkt(srs_h, &c_wktstr);
-    if (c_wktstr == nullptr)
-        throwError("bad srs");
-    std::string srs_wkt{c_wktstr};
-    CPLFree(c_wktstr);
-    SpatialReference mylayerSrs(srs_wkt);
-    // log()->get(LogLevel::Info) << "layer srs:  " << srs_wkt << "\n";
-
-    // gather field info
-    log()->get(LogLevel::Info) << "columns: " << m_columns.size() << "\n";
-    for (const auto& col : m_columns)
-    {
-        log()->get(LogLevel::Info) << " " << col << "\n";
-        m_fields.push_back(FieldInfo(lyr, col));
-    }
-    log()->get(LogLevel::Info) << "fields: " << m_fields.size() << "\n";
-    if (m_fields.empty())
-        m_fields.push_back(FieldInfo(lyr, 0));
-
-    // read features
-    auto featureDeleter = [](OGRFeaturePtr::element_type* p)
-    {
-        if (p)
-            ::OGR_F_Destroy(p);
-    };
-
-    for (auto feature = OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter); feature;
-         feature = OGRFeaturePtr(OGR_L_GetNextFeature(lyr), featureDeleter))
-    {
-        log()->get(LogLevel::Info) << "reading a feature\n";
-        OGRGeometryH geom = OGR_F_GetGeometryRef(feature.get());
-
-        PolyVal pv;
-        pv.geom = Polygon(geom, mylayerSrs);
-
-        for (const auto& field : m_fields)
-            pv.values.push_back(field.read(feature));
-
-        m_polygons.push_back(pv);
-    }
-
-    // Initialise m_grids, otherwise this will lead to a race condition when
-    // using threading.
-    for (const auto& poly : m_polygons)
-    {
-        poly.geom.initGrids();
-        for (const auto& c : poly.values)
-            std::cout << c << " ";
-        std::cout << "\n";
-    }
+        m_table = ds.loadIndex(0, m_columns);
 }
 
 void OverlayFilterX::spatialReferenceChanged(const SpatialReference& srs)
 {
     if (srs.empty())
         return;
-    for (auto& poly : m_polygons)
+    for (auto& poly : m_table.geom)
     {
-        auto ok = poly.geom.transform(srs);
+        auto ok = poly.transform(srs);
         if (!ok)
             throwError(ok.what());
     }
@@ -218,20 +137,19 @@ bool OverlayFilterX::processOne(PointRef& point)
     return true;
 }
 
-std::vector<std::vector<int64_t>> OverlayFilterX::intersect(double x, double y,
-                                                            bool firstOnly) const
+std::vector<size_t> OverlayFilterX::intersect(double x, double y, bool firstOnly) const
 {
-    std::vector<std::vector<int64_t>> data;
-    for (const auto& poly : m_polygons)
+    std::vector<size_t> rowIndicies;
+    for (size_t i = 0; i < m_table.geom.size(); ++i)
     {
-        if (poly.geom.contains(x, y))
+        if (m_table.geom[i].contains(x, y))
         {
-            data.push_back(poly.values);
+            rowIndicies.push_back(i);
             if (firstOnly)
                 break;
         }
     }
-    return data;
+    return rowIndicies;
 }
 
 point_count_t appendCopy(PointViewPtr targetView, const PointView& srcView, PointId srcId)
@@ -268,14 +186,14 @@ void OverlayFilterX::filter(PointView& view)
                     double y = view.getFieldAs<double>(Dimension::Id::Y, id);
 
                     // traverse the table, assign or create points
-                    auto features = intersect(x, y, m_firstOnly);
-                    for (size_t feat = 0; feat < features.size(); ++feat)
+                    auto rowIndices = intersect(x, y, m_firstOnly);
+                    for (const auto& row : rowIndices)
                     {
                         // the first polygon intersected must go to the
                         // existing point. the remaining polygons cause
                         // additional points to be created.
                         std::unique_ptr<PointRef> toWrite; // only way i could make it work
-                        if (feat == 0)
+                        if (row == rowIndices[0])
                         {
                             toWrite = std::make_unique<PointRef>(view, id);
                         }
@@ -285,13 +203,13 @@ void OverlayFilterX::filter(PointView& view)
                             toWrite = std::make_unique<PointRef>(*addedPoints[t], idxAppened);
                         }
 
-                        auto featureCols = features[feat];
-                        for (size_t col = 0; col < featureCols.size(); ++col)
+                        auto attribs = m_table.getAttributes(row);
+                        for (size_t i = 0; i < m_dims.size(); ++i)
                         {
                             // the indices for the dimensions and feature column
                             // should be aligned.
-                            auto targetDim = m_dims[col];
-                            auto dataForDim = featureCols[col];
+                            auto targetDim = m_dims[i];
+                            auto dataForDim = attribs[m_columns[i]];
                             toWrite->setField(targetDim, dataForDim);
                         }
                     }
