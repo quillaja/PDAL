@@ -42,10 +42,8 @@
 
 #include <iostream>
 #include <map>
-#include <memory>
 #include <string>
-#include <type_traits>
-#include <variant>
+#include <unordered_map>
 
 // Get GDAL's forward decls if available
 // otherwise make our own
@@ -73,12 +71,7 @@ typedef std::shared_ptr<void> OGRFeaturePtr;
 
 class Arg;
 
-// using IntOrReal = std::variant<int64_t, double>;
-using IntOrReal = int64_t;
-
-using IntOrRealList = std::vector<IntOrReal>;
-
-struct FieldInfo
+template <typename T = int64_t> struct FieldInfo
 {
     std::string name;
     int index;
@@ -93,25 +86,18 @@ struct FieldInfo
     {
         // TODO check index=-1 error
         auto lyrDef = OGR_L_GetLayerDefn(lyr);
-        std::cout << "1 ";
         auto fieldDef = OGR_FD_GetFieldDefn(lyrDef, index);
-        std::cout << "2 ";
         auto ftype = OGR_Fld_GetType(fieldDef);
-        std::cout << "ftype = " << ftype << "\n";
-        std::cout << "3 ";
-        name = OGR_Fld_GetNameRef(fieldDef);
-        std::cout << "name = " << name << "\n";
-        std::cout << "4 ";
         type = mapOGRToDimType(ftype);
-        std::cout << "5 ";
+        name = OGR_Fld_GetNameRef(fieldDef);
     }
 
-    IntOrReal read(const OGRFeaturePtr featurePtr) const
+    T read(const OGRFeaturePtr featurePtr) const
     {
         return read(featurePtr.get());
     }
 
-    IntOrReal read(const OGRFeatureH feature) const
+    T read(const OGRFeatureH feature) const
     {
         switch (type)
         {
@@ -144,13 +130,119 @@ struct FieldInfo
     }
 };
 
+template <typename T = int64_t, typename GEOM = Polygon> struct Table
+{
+    struct Field
+    {
+        FieldInfo<T> meta;
+        std::vector<T> values;
+    };
+
+    std::vector<GEOM> geom;
+    std::unordered_map<std::string, Field> attributes;
+
+    GEOM getGeom(const size_t row)
+    {
+        return geo[row];
+    }
+    std::unordered_map<std::string, T> getAttributes(const size_t row)
+    {
+        std::unordered_map<std::string, T> data;
+        for (const auto& [name, attrib] : attributes)
+            data[name] = attrib.values[row];
+    }
+};
+
+template <typename T = int64_t> class Datasource
+{
+public:
+    Datasource() = delete;
+    Datasource(const Datasource&) = delete;
+
+    Datasource(const std::string& source) : datasource{OGROpen(source.c_str(), 0, nullptr)} {};
+    Datasource(const std::string& source, const BOX2D& bounds) : Datasource(source), bounds{bounds}
+    {
+    }
+
+    ~Datasource()
+    {
+        OGR_DS_Destroy(datasource);
+    }
+
+    Table<T> loadLayer(const std::string& layerName, const std::vector<std::string>& fields)
+    {
+        load(OGR_DS_GetLayerByName(datasource, layerName.c_str()), fields);
+    }
+    Table<T> loadQuery(const std::string& query, const std::vector<std::string>& fields)
+    {
+
+        load(OGR_DS_ExecuteSQL(datasource, query.c_str(), 0, 0), fields);
+    }
+
+    Table<T> loadIndex(const uint32_t layerIndex, const std::vector<std::string>& fields)
+    {
+        load(OGR_DS_GetLayer(datasource, layerIndex), fields);
+    }
+
+private:
+    OGRDataSourceH datasource;
+    BOX2D bounds;
+
+    Table<T> load(const OGRLayerH lyr, const std::vector<std::string>& fields)
+    {
+        Table<T> t;
+
+        if (bounds.valid())
+            OGR_L_SetSpatialFilterRect(lyr, bounds.minx, bounds.miny, bounds.maxx, bounds.maxy);
+
+        // fill attribute metadata
+        for (const auto& field : fields)
+            t.attributes[field].meta = FieldInfo{lyr, field};
+
+        auto srs = getSrs(lyr);
+
+        for (auto feature = OGR_L_GetNextFeature(lyr); feature; feature = OGR_L_GetNextFeature(lyr))
+        {
+            // read attributes
+            for (const auto& field : fields)
+            {
+                auto value = t.attributes[field].meta.read(feature); // goofy
+                t.attributes[field].values.push_back(value);
+            }
+            // read geometry
+            {
+                auto geom = OGR_F_GetGeometryRef(feature);
+                auto poly = Polygon(geom, srs);
+                poly.initGrids();
+                t.geom.push_back(poly);
+            }
+            // dispose
+            OGR_F_Destroy(feature);
+        }
+
+        return t;
+    }
+
+    SpatialReference getSrs(OGRLayerH lyr)
+    {
+        auto srs_h = OGR_L_GetSpatialRef(lyr);
+        char* c_wktstr = nullptr;
+        OSRExportToWkt(srs_h, &c_wktstr);
+        if (c_wktstr == nullptr)
+            throwError("bad srs");
+        const std::string srs_wkt{c_wktstr};
+        CPLFree(c_wktstr);
+        return SpatialReference{srs_wkt};
+    }
+};
+
 class OverlayFilterX : public Filter, public Streamable
 {
 
     struct PolyVal
     {
         Polygon geom;
-        IntOrRealList values;
+        std::vector<int64_t> values;
     };
 
 public:
@@ -173,7 +265,7 @@ private:
     OverlayFilterX& operator=(const OverlayFilterX&) = delete;
     OverlayFilterX(const OverlayFilterX&) = delete;
 
-    std::vector<IntOrRealList> intersect(double x, double y, bool firstOnly) const;
+    std::vector<std::vector<int64_t>> intersect(double x, double y, bool firstOnly) const;
 
     OGRDSPtr m_ds;
     std::string m_datasource;
@@ -184,7 +276,7 @@ private:
     StringList m_dimNames;
     Dimension::IdList m_dims;
 
-    std::vector<FieldInfo> m_fields;
+    std::vector<FieldInfo<int64_t>> m_fields;
     std::vector<PolyVal> m_polygons;
     BOX2D m_bounds;
     int m_threads;
