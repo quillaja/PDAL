@@ -218,9 +218,10 @@ bool OverlayFilterX::processOne(PointRef& point)
     return true;
 }
 
-std::vector<IntOrRealList> OverlayFilterX::intersect(double x, double y, bool firstOnly) const
+std::vector<std::vector<int64_t>> OverlayFilterX::intersect(double x, double y,
+                                                            bool firstOnly) const
 {
-    std::vector<IntOrRealList> data;
+    std::vector<std::vector<int64_t>> data;
     for (const auto& poly : m_polygons)
     {
         if (poly.geom.contains(x, y))
