@@ -100,14 +100,16 @@ void OverlayFilterX::prepared(PointTableRef table)
 
 void OverlayFilterX::ready(PointTableRef table)
 {
-    Datasource<int64_t> ds{m_datasource, m_bounds};
+    Datasource ds{m_datasource, m_bounds};
 
     if (!m_query.empty())
-        m_table = ds.loadQuery(m_query, m_columns);
+        m_table = ds.loadQuery<int64_t>(m_query, m_columns);
     else if (!m_layer.empty())
-        m_table = ds.loadLayer(m_layer, m_columns);
+        m_table = ds.loadLayer<int64_t>(m_layer, m_columns);
     else
-        m_table = ds.loadIndex(0, m_columns);
+        m_table = ds.loadIndex<int64_t>(0, m_columns);
+
+    m_table.print();
 }
 
 void OverlayFilterX::spatialReferenceChanged(const SpatialReference& srs)

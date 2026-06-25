@@ -73,81 +73,35 @@ typedef std::shared_ptr<void> OGRFeaturePtr;
 
 class Arg;
 
-template <typename T = int64_t> struct FieldInfo
+struct FieldInfo
 {
     std::string name;
     int index;
-    Dimension::Type type;
-
-    FieldInfo() = default;
-
-    FieldInfo(OGRLayerH lyr, std::string fieldName)
-        : FieldInfo(lyr, OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0))
-    {
-    }
-
-    FieldInfo(OGRLayerH lyr, int index) : index{index}
-    {
-        // TODO check index=-1 error
-        auto lyrDef = OGR_L_GetLayerDefn(lyr);
-        auto fieldDef = OGR_FD_GetFieldDefn(lyrDef, index);
-        auto ftype = OGR_Fld_GetType(fieldDef);
-        type = mapOGRToDimType(ftype);
-        name = OGR_Fld_GetNameRef(fieldDef);
-    }
-
-    T read(const OGRFeaturePtr featurePtr) const
-    {
-        return read(featurePtr.get());
-    }
-
-    T read(const OGRFeatureH feature) const
-    {
-        switch (type)
-        {
-        case Dimension::Type::Double:
-            return OGR_F_GetFieldAsDouble(feature, index);
-
-        case Dimension::Type::Signed64:
-            return OGR_F_GetFieldAsInteger64(feature, index);
-
-        default:
-            // ???
-            return -1;
-        }
-    }
-
-    static Dimension::Type mapOGRToDimType(const OGRFieldType ogrType)
-    {
-        switch (ogrType)
-        {
-        case OGRFieldType::OFTReal:
-            return Dimension::Type::Double;
-
-        case OGRFieldType::OFTInteger64:
-        case OGRFieldType::OFTInteger:
-            return Dimension::Type::Signed64;
-
-        default:
-            return Dimension::Type::None;
-        }
-    }
+    OGRFieldType type;
 };
+
+Dimension::Type mapOGRToDimType(const OGRFieldType ogrType)
+{
+    switch (ogrType)
+    {
+    case OGRFieldType::OFTReal:
+        return Dimension::Type::Double;
+
+    case OGRFieldType::OFTInteger64:
+    case OGRFieldType::OFTInteger:
+        return Dimension::Type::Signed64;
+
+    default:
+        return Dimension::Type::None;
+    }
+}
 
 template <typename T = int64_t, typename GEOM = Polygon> struct Table
 {
-    struct Field
-    {
-        FieldInfo<T> meta;
-        std::vector<T> values;
-
-        // Field() = delete;
-        Field() = default;
-        Field(const FieldInfo<T>& info) : meta{std::move(info)}, values{} {};
-    };
 
     std::vector<GEOM> geom;
-    std::unordered_map<std::string, Field> attributes;
+    std::unordered_map<std::string, FieldInfo> meta;
+    std::unordered_map<std::string, std::vector<T>> attributes;
 
     GEOM getGeom(const size_t row)
     {
@@ -157,12 +111,35 @@ template <typename T = int64_t, typename GEOM = Polygon> struct Table
     {
         std::unordered_map<std::string, T> data;
         for (const auto& [name, attrib] : attributes)
-            data[name] = attrib.values[row];
+            data[name] = attrib[row];
         return data;
+    }
+
+    void print() const
+    {
+        std::vector<std::string> cols;
+        size_t rows{0};
+        size_t colW{0};
+        for (const auto& [name, data] : attributes)
+        {
+            cols.push_back(name);
+            colW = (std::max)(colW, name.size());
+            rows = data.size();
+        }
+
+        for (const auto& col : cols)
+            std::cout << std::setw(colW) << col;
+        std::cout << "\n";
+        for (size_t row = 0; row < rows; ++row)
+        {
+            for (const auto& col : cols)
+                std::cout << std::setw(colW) << attributes.at(col)[row];
+            std::cout << "\n";
+        }
     }
 };
 
-template <typename T = int64_t> class Datasource
+class Datasource
 {
 public:
     Datasource() = delete;
@@ -180,26 +157,82 @@ public:
         OGR_DS_Destroy(datasource);
     }
 
-    Table<T> loadLayer(const std::string& layerName, const std::vector<std::string>& fields)
+    std::vector<std::string> getLayerNames() const
     {
-        return load(OGR_DS_GetLayerByName(datasource, layerName.c_str()), fields);
+        std::vector<std::string> layers;
+        size_t count = OGR_DS_GetLayerCount(datasource);
+        for (size_t i = 0; i < count; i++)
+        {
+            auto lyr = OGR_DS_GetLayer(datasource, i);
+            layers.push_back(OGR_L_GetName(lyr));
+        }
+        return layers;
     }
-    Table<T> loadQuery(const std::string& query, const std::vector<std::string>& fields)
+
+    template <typename T = int64_t>
+    Table<T> loadLayer(const std::string& layerName, const std::vector<std::string>& fields) const
+    {
+        return load<T>(OGR_DS_GetLayerByName(datasource, layerName.c_str()), fields);
+    }
+    template <typename T = int64_t>
+    Table<T> loadQuery(const std::string& query, const std::vector<std::string>& fields) const
     {
 
-        return load(OGR_DS_ExecuteSQL(datasource, query.c_str(), 0, 0), fields);
+        return load<T>(OGR_DS_ExecuteSQL(datasource, query.c_str(), 0, 0), fields);
     }
-
-    Table<T> loadIndex(const uint32_t layerIndex, const std::vector<std::string>& fields)
+    template <typename T = int64_t>
+    Table<T> loadIndex(const uint32_t layerIndex, const std::vector<std::string>& fields) const
     {
-        return load(OGR_DS_GetLayer(datasource, layerIndex), fields);
+        return load<T>(OGR_DS_GetLayer(datasource, layerIndex), fields);
     }
 
 private:
     OGRDataSourceH datasource;
     BOX2D bounds;
 
-    Table<T> load(const OGRLayerH lyr, const std::vector<std::string>& fields)
+    FieldInfo getMeta(const OGRLayerH lyr, const std::string& fieldName) const
+    {
+        return getMeta(lyr, OGR_L_FindFieldIndex(lyr, fieldName.c_str(), 0));
+    }
+
+    FieldInfo getMeta(const OGRLayerH lyr, int index) const
+    {
+        // TODO check index=-1 error
+        auto lyrDef = OGR_L_GetLayerDefn(lyr);
+        auto fieldDef = OGR_FD_GetFieldDefn(lyrDef, index);
+        return FieldInfo{
+            .name = OGR_Fld_GetNameRef(fieldDef),
+            .index = index,
+            .type = OGR_Fld_GetType(fieldDef),
+        };
+    }
+
+    template <typename T> T read(const OGRFeatureH feature, const FieldInfo& fieldMeta) const
+    {
+        switch (fieldMeta.type)
+        {
+        case OGRFieldType::OFTReal:
+            return static_cast<T>(OGR_F_GetFieldAsDouble(feature, fieldMeta.index));
+
+        case OGRFieldType::OFTInteger64:
+        case OGRFieldType::OFTInteger:
+            return static_cast<T>(OGR_F_GetFieldAsInteger64(feature, fieldMeta.index));
+
+            // case OGRFieldType::OFTWideString:
+            //     return static_cast<T>(OGR_F_GetFieldAsString(feature, index));
+
+            // case OGRFieldType::OFTDate:
+            // case OGRFieldType::OFTDateTime:
+            //     return static_cast<T>(OGR_F_GetFieldAsDateTime(feature, index));
+
+        default:
+            // ???
+            throw std::exception("don't know what to do with that field");
+        }
+    }
+
+    template <typename T>
+    Table<T> load(const OGRLayerH lyr, const std::vector<std::string>& fields) const
     {
         Table<T> t;
 
@@ -208,7 +241,7 @@ private:
 
         // fill attribute metadata
         for (const auto& field : fields)
-            t.attributes.try_emplace(field, FieldInfo<T>{lyr, field});
+            t.meta[field] = getMeta(lyr, field);
 
         auto srs = getSrs(lyr);
 
@@ -217,8 +250,8 @@ private:
             // read attributes
             for (const auto& field : fields)
             {
-                auto value = t.attributes[field].meta.read(feature); // goofy
-                t.attributes[field].values.push_back(value);
+                T value{read<T>(feature, t.meta[field])};
+                t.attributes[field].push_back(value);
             }
             // read geometry
             {
@@ -234,7 +267,7 @@ private:
         return t;
     }
 
-    SpatialReference getSrs(OGRLayerH lyr)
+    SpatialReference getSrs(OGRLayerH lyr) const
     {
         auto srs_h = OGR_L_GetSpatialRef(lyr);
         char* c_wktstr = nullptr;
